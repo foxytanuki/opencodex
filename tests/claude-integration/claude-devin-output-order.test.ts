@@ -192,6 +192,67 @@ const config = (): OcxConfig => ({ port: 0, defaultProvider: "cognition-custom",
   providers: { "cognition-custom": { adapter: "devin", baseUrl: "https://synthetic.invalid", apiKey: "synthetic-key", models: ["swe-2"] } },
 });
 
+test("retained terminal usage is isolated from producer and consumer mutations", async () => {
+  const budget = createTestTranslatorBudget();
+  const abort = new AbortController();
+  const originalUsage = { ...usage, rawUsage: { detail: { tokens: 3 } } };
+  const ending: AdapterEvent = { type: "done", usage: originalUsage };
+  const iterator = orderDevinMessagesOutput((async function* () {
+    yield { type: "text_delta", text: "OK" } as AdapterEvent;
+    yield ending;
+  })(), budget, abort.signal, () => abort.abort());
+  await iterator.next(); // Progress while the answer is retained.
+  expect((await iterator.next()).value).toEqual({ type: "text_delta", text: "OK" });
+  const measuredBytes = budget.snapshot().currentBytes;
+  originalUsage.outputTokens = 999;
+  originalUsage.rawUsage.detail.tokens = 999;
+  const result = (await iterator.next()).value;
+  expect(result).toEqual({ type: "done", usage: { ...usage, rawUsage: { detail: { tokens: 3 } } } });
+  if (!result || result.type !== "done" || !result.usage) throw new Error("missing terminal usage");
+  result.usage.outputTokens = 1;
+  expect(originalUsage.outputTokens).toBe(999);
+  expect(budget.snapshot().currentBytes).toBeLessThan(measuredBytes);
+  expect((await iterator.next()).done).toBe(true);
+  expect(budget.snapshot().currentBytes).toBe(0);
+});
+
+test("a stalled Devin turn sends repeated Messages pings before releasing the held answer", async () => {
+  const budget = createTestTranslatorBudget();
+  const abort = new AbortController();
+  const queue = createAdapterEventQueue();
+  const events = orderDevinMessagesOutput(queue.stream(), budget, abort.signal, () => abort.abort());
+  const bridge = bridgeToResponsesSSE(events, "swe-2", undefined, undefined, undefined, undefined, 2000, { translatorBudget: budget });
+  const reader = responsesSseToAnthropicSse(bridge, "devin/swe-2", { translatorBudget: budget, pingIntervalMs: 10 }).getReader();
+  const chunks: string[] = [];
+  const decoder = new TextDecoder();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  queue.push({ type: "text_delta", text: "OK" });
+  try {
+    await Promise.race([(async () => {
+      // Include a periodic ping after the progress ping from held text.
+      while ((chunks.join("").match(/event: ping/g) ?? []).length < 3) {
+        const next = await reader.read();
+        if (next.done) throw new Error("stream ended before the signature");
+        chunks.push(decoder.decode(next.value, { stream: true }));
+      }
+    })(), new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("stalled Messages stream sent no pings")), 1000); })]);
+    expect(chunks.join("")).not.toContain("text_delta");
+    expect(budget.snapshot().currentBytes).toBeGreaterThan(0);
+    queue.push({ type: "thinking_signature", signature });
+    queue.push(terminal);
+    queue.close();
+    for (;;) {
+      const next = await reader.read();
+      if (next.done) break;
+      chunks.push(decoder.decode(next.value, { stream: true }));
+    }
+    const wire = chunks.join("");
+    expect(wire).toContain('"text":"OK"');
+    expect(wire.indexOf("signature_delta")).toBeLessThan(wire.indexOf("text_delta"));
+    expect(wire).toContain("event: message_stop");
+  } finally { clearTimeout(timer); queue.close(); await reader.cancel(); budget.dispose(); }
+});
+
 for (const stream of [true, false]) {
   test(`actual Messages ingress orders a renamed Devin provider, stream=${stream}`, async () => {
     upstreamEvents = [{ type: "text_delta", text: "OK" }, { type: "thinking_signature", signature }, terminal];

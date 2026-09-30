@@ -65,7 +65,9 @@ export async function* orderDevinMessagesOutput(
         yield event;
         continue;
       }
-      const copy = { ...event } as AdapterEvent;
+      // Retention owns a snapshot, including nested usage, so later producer or
+      // consumer mutations cannot change the bytes measured by the budget.
+      const copy = structuredClone(event);
       try {
         retainTranslatedEvent(copy, budget, held.at(-1));
         held.push(copy);
