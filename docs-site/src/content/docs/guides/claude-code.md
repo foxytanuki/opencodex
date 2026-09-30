@@ -7,8 +7,8 @@ opencodex serves `POST /v1/messages` (plus `count_tokens`) alongside `/v1/respon
 Code can use every routed provider — OAuth logins, account pools, key failover and sidecars
 included — with zero extra auth work.
 
-On Devin routes (including SWE-2), text and tool calls wait for the upstream turn to complete
-so its late reasoning signature can precede the answer. This prevents Claude Code's final
+On Devin routes (including SWE-2) reached through the Messages API, text and tool calls wait
+for the upstream turn to complete so its late reasoning signature can precede the answer. This prevents Claude Code's final
 result from becoming empty; reasoning and keepalive progress still flow during generation.
 The buffer shares the request's 32 MiB translation limit and cancellation stops the producer.
 This output-order fix does not resolve Cognition's separate refusal of some generated system
