@@ -1,4 +1,5 @@
 {
+  "claude-devin-output-order.test.ts": "claude-integration",
     "service-desktop-startup-health.test.ts": "service",
     "service-desktop-startup.test.ts": "service",
     "startup-health-packaged-probe.test.ts": "server",

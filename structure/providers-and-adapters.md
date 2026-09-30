@@ -1,5 +1,8 @@
 # Providers And Adapters
 
+Devin Messages follows the [per-turn output ordering contract](clients/claude-desktop.md#devin-messages-output-ordering),
+preserving late signatures before text/tools without changing Responses or Chat ordering.
+
 Anthropic account pause, model routes, and quota labels follow the
 [Anthropic account-pool contract](providers/anthropic-account-pool.md).
 

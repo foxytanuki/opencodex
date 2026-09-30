@@ -50,6 +50,7 @@ import { undeclaredToolCallMessage } from "../responses-undeclared-tool-guard";
 import { planWebSearch } from "../../web-search";
 import { runTurnWebSearchInitialParsed, runTurnWebSearchLoop } from "../../web-search/run-turn-loop";
 import { WEB_SEARCH_TOOL_NAME } from "../../web-search/synthetic-tool";
+import { createDevinMessagesOutputOrder } from "../../claude/devin-output-order";
 
 // LOCAL PATCH (runturn-websearch): top-level fields route binding or the
 // adapter itself may write during a turn. Iteration-local `turnParsed` objects
@@ -229,6 +230,7 @@ export async function executeResponsesRunTurn(
         options.onCompactionRecoveryAdapterEvent?.(event);
         targetQueue.push(event);
       };
+      let messagesOutput: ReturnType<typeof createDevinMessagesOutputOrder> | undefined;
       try {
         if (!pacingSlotAcquired) {
           pacingSlot = await waitForProviderRequestSlot(route.providerName, route.provider, route.modelId, runTurnAbort.signal);
@@ -261,6 +263,9 @@ export async function executeResponsesRunTurn(
             turnScopedPacing: true,
           },
         );
+        if (inboundWire === "anthropic" && transportState.runTurnAdapter.name === "devin" && !routedCompaction) {
+          messagesOutput = createDevinMessagesOutputOrder(emit, translatorBudget, runTurnAbort.signal, () => runTurnAbort.abort());
+        }
         await transportState.runTurnAdapter.runTurn?.(
           turnParsed,
           {
@@ -282,7 +287,7 @@ export async function executeResponsesRunTurn(
             ),
             onRecoveryWithheld: noteAdapterRecoveryWithheld,
           },
-          emit,
+          messagesOutput?.emit ?? emit,
         );
         // LOCAL PATCH (runturn-websearch): adapters may write conversation/
         // continuation state onto the object they received; merge it back so
@@ -296,7 +301,7 @@ export async function executeResponsesRunTurn(
           Object.assign(parsed, routeState);
         }
       } catch (err) {
-        emit(err instanceof RequestPacingQueueOverloadError
+        (messagesOutput?.emit ?? emit)(err instanceof RequestPacingQueueOverloadError
           ? {
               type: "error",
               status: 429,
@@ -321,6 +326,8 @@ export async function executeResponsesRunTurn(
                 message: err instanceof Error ? err.message : String(err),
               });
       } finally {
+        messagesOutput?.flush();
+        messagesOutput?.dispose();
         releaseProviderRequestSlot(pacingSlot);
         // Cursor assigns a stable conversation id inside runTurn on the first headerless
         // turn; backfill so Logs can filter/total that opening request (#330 / #522).
