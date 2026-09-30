@@ -57,8 +57,8 @@ lifecycle, cancellation races, protocol envelopes, and the real HTTP admission b
 ## Stream-buffer accounting
 
 Devin's [Messages ordering buffer](../clients/claude-desktop.md#devin-messages-output-ordering) charges retained
-semantic events to the shared translator budget until transfer to the independently bounded
-adapter queue. Cancellation and overflow release held events before producer shutdown.
+semantic events consumed from the independently bounded adapter queue to the shared translator
+budget until downstream delivery. Cancellation and overflow release held events before producer shutdown.
 
 `src/web-search/run-turn-loop.ts` charges retained iteration events and generated replay history to
 the request translator budget. Each owner releases its own reservations on completion, error,

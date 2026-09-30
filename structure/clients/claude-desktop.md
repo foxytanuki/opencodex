@@ -31,7 +31,7 @@ belongs to the shared account store. The import CLI adds pool rows independently
 
 ## Devin Messages output ordering
 
-`src/claude/devin-output-order.ts` orders each physical Devin turn at the emitter in
+`src/claude/devin-output-order.ts` orders each physical Devin turn after raw-event preflight in
 `src/server/responses/run-turn-execution.ts` when the original inbound wire is Anthropic
 Messages. Provider names may be customized; the selected adapter determines applicability.
 Text and tool events wait for that turn's terminal so Cognition's late reasoning signature
@@ -40,9 +40,12 @@ signature-only thinking block. Reasoning and transport progress remain live; ans
 tool dispatch incur turn-completion latency. Responses and Chat retain their original ordering,
 and routed compaction is excluded.
 
-Retained events share the request translator budget and are released on terminal, cancellation,
-overflow, or adapter EOF. Overflow emits one typed `translation_buffer_limit` error and aborts
-the producer. Error and incomplete terminals retain partial output and their original usage.
+Retained events share the request translator budget and drain on demand without a synchronous
+burst into the adapter queue. They are released on terminal, cancellation, overflow, or adapter
+EOF. Overflow emits one typed `translation_buffer_limit` error and aborts only active Devin
+producers, preserving error classification through hosted search. Cancellation drops held
+semantic output but forwards the adapter's terminal and usage when the consumer keeps reading.
+Adapter error and incomplete terminals retain partial output and their original usage.
 Ordering occurs before hosted-search interception, independently for each physical iteration,
 so one iteration's signature cannot be attached to another iteration's answer.
 

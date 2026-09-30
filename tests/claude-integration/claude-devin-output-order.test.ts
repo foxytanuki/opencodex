@@ -1,5 +1,5 @@
 import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
-import { createDevinMessagesOutputOrder } from "../../src/claude/devin-output-order";
+import { orderDevinMessagesOutput } from "../../src/claude/devin-output-order";
 import { collectAnthropicMessage, responsesSseToAnthropicSse } from "../../src/claude/outbound";
 import { bridgeToResponsesSSE } from "../../src/bridge";
 import { createTestTranslatorBudget } from "../helpers/translator-budget";
@@ -9,6 +9,10 @@ import { messagesToResponsesTranslation } from "../../src/protocols/codecs/messa
 import { parseRequest } from "../../src/responses/parser";
 import type { AdapterEvent, OcxConfig, OcxProviderConfig } from "../../src/types";
 import type { ProviderAdapter } from "../../src/adapters/base";
+import { createAdapterEventQueue } from "../../src/adapters/run-turn-queue";
+import { runTurnWebSearchLoop } from "../../src/web-search/run-turn-loop";
+import { DEVIN_CLI_CREDENTIALS_ENV } from "../../src/oauth/devin/cli-import";
+import { saveCredential } from "../../src/oauth/store";
 import { createTempHome } from "../helpers/temp-home";
 import { acquireOwnedSpendHome } from "../helpers/owned-spend-home";
 import { installIsolatedCodexHome } from "../helpers/isolated-codex-home";
@@ -17,6 +21,8 @@ const signature = encodeDevinSignature("sealed.v1.synthetic-attestation", "seale
 const usage = { inputTokens: 12, outputTokens: 3, totalTokens: 15 };
 const terminal: AdapterEvent = { type: "done", usage };
 let upstreamEvents: AdapterEvent[] = [];
+let afterFirstEvent: (() => Promise<void>) | undefined;
+let paceFragments = false;
 const resolver = await import("../../src/server/adapter-resolve");
 const originalResolver = { ...resolver };
 mock.module("../../src/server/adapter-resolve", () => ({ ...originalResolver,
@@ -26,7 +32,13 @@ mock.module("../../src/server/adapter-resolve", () => ({ ...originalResolver,
       name: "devin",
       buildRequest: () => ({ url: provider.baseUrl, method: "POST", headers: {}, body: "" }),
       async *parseStream() { yield terminal; },
-      async runTurn(_parsed, _incoming, emit) { upstreamEvents.forEach(emit); },
+      async runTurn(_parsed, _incoming, emit) {
+        for (let index = 0; index < upstreamEvents.length; index++) {
+          emit(upstreamEvents[index]!);
+          if (index === 0) await afterFirstEvent?.();
+          if (paceFragments && index % 16 === 0) await new Promise<void>(resolve => setImmediate(resolve));
+        }
+      },
     } satisfies ProviderAdapter;
   },
 }));
@@ -37,25 +49,34 @@ afterAll(() => { mock.module("../../src/server/adapter-resolve", () => originalR
 let home: ReturnType<typeof createTempHome>;
 let codexHome: ReturnType<typeof installIsolatedCodexHome>;
 let releaseSpend: () => void;
+let previousCliCredentialsPath: string | undefined;
 beforeEach(() => {
   home = createTempHome("ocx-claude-devin-output-");
   codexHome = installIsolatedCodexHome("ocx-claude-devin-codex-");
   releaseSpend = acquireOwnedSpendHome();
+  previousCliCredentialsPath = process.env[DEVIN_CLI_CREDENTIALS_ENV];
+  process.env[DEVIN_CLI_CREDENTIALS_ENV] = home.path("absent-devin-cli.toml");
   upstreamEvents = [];
+  afterFirstEvent = undefined;
+  paceFragments = false;
 });
-afterEach(() => { releaseSpend(); codexHome.restore(); home.remove(); });
+afterEach(() => {
+  if (previousCliCredentialsPath === undefined) delete process.env[DEVIN_CLI_CREDENTIALS_ENV];
+  else process.env[DEVIN_CLI_CREDENTIALS_ENV] = previousCliCredentialsPath;
+  releaseSpend(); codexHome.restore(); home.remove();
+});
 
-function ordered(events: AdapterEvent[]) {
+async function ordered(events: AdapterEvent[]) {
   const budget = createTestTranslatorBudget();
   const abort = new AbortController();
   const output: AdapterEvent[] = [];
-  const order = createDevinMessagesOutputOrder(event => output.push(event), budget, abort.signal, () => abort.abort());
-  try { events.forEach(order.emit); order.flush(); } finally { order.dispose(); }
+  for await (const event of orderDevinMessagesOutput((async function* () { yield* events; })(),
+    budget, abort.signal, () => abort.abort())) output.push(event);
   return { output, budget };
 }
 
 async function message(events: AdapterEvent[]) {
-  const { output, budget } = ordered(events);
+  const { output, budget } = await ordered(events);
   const source = (async function* () { yield* output; })();
   const bridged = bridgeToResponsesSSE(source, "swe-2", undefined, undefined, undefined, undefined, 0, { translatorBudget: budget });
   return collectAnthropicMessage(responsesSseToAnthropicSse(bridged, "devin/swe-2", {
@@ -121,44 +142,50 @@ describe("Devin Messages late signatures", () => {
 
   for (const ending of [terminal, { type: "incomplete", reason: "max_tokens", usage },
     { type: "error", status: 502, message: "synthetic reset", usage }] as AdapterEvent[]) {
-    test(`${ending.type} preserves partial content and the original terminal`, () => {
-      const { output, budget } = ordered([{ type: "text_delta", text: "partial" }, ending]);
+    test(`${ending.type} preserves partial content and the original terminal`, async () => {
+      const { output, budget } = await ordered([{ type: "text_delta", text: "partial" }, ending]);
       expect(output.filter(event => event.type !== "heartbeat")).toEqual([{ type: "text_delta", text: "partial" }, ending]);
       expect(budget.snapshot().currentBytes).toBe(0);
     });
   }
 
-  test("holding output keeps progress live and cancellation releases it immediately", () => {
+  test("holding output keeps progress live and cancellation preserves the adapter terminal and usage", async () => {
     const budget = createTestTranslatorBudget();
     const abort = new AbortController();
-    const output: AdapterEvent[] = [];
-    const order = createDevinMessagesOutputOrder(event => output.push(event), budget, abort.signal, () => abort.abort());
-    order.emit({ type: "text_delta", text: "still generating" });
-    expect(output).toEqual([{ type: "heartbeat" }]);
+    const queue = createAdapterEventQueue();
+    const iterator = orderDevinMessagesOutput(queue.stream(), budget, abort.signal, () => abort.abort());
+    queue.push({ type: "text_delta", text: "still generating" });
+    expect((await iterator.next()).value).toEqual({ type: "heartbeat" });
     expect(budget.snapshot().currentBytes).toBeGreaterThan(0);
-    order.emit({ type: "heartbeat", replayUnsafe: true });
-    expect(output.at(-1)).toEqual({ type: "heartbeat", replayUnsafe: true });
+    queue.push({ type: "heartbeat", replayUnsafe: true });
+    expect((await iterator.next()).value).toEqual({ type: "heartbeat", replayUnsafe: true });
     abort.abort();
     expect(budget.snapshot().currentBytes).toBe(0);
-    order.emit(terminal);
-    order.dispose();
-    expect(output.some(event => event.type === "text_delta" || event.type === "done")).toBe(false);
+    const cancelled: AdapterEvent = { type: "error", status: 499, message: "client closed request", usage };
+    queue.push(cancelled);
+    queue.close();
+    expect((await iterator.next()).value).toEqual(cancelled);
+    expect((await iterator.next()).done).toBe(true);
   });
 
-  test("overflow emits one typed error, aborts the producer, and releases held output", () => {
+  test("overflow emits one typed error and stops only the producer, preserving search error classification", async () => {
     const budget = createTestTranslatorBudget({ maxTurnBytes: 160 });
-    const abort = new AbortController();
+    const requestAbort = new AbortController();
+    const producerAbort = new AbortController();
     const output: AdapterEvent[] = [];
-    const order = createDevinMessagesOutputOrder(event => output.push(event), budget, abort.signal, () => abort.abort());
-    order.emit({ type: "text_delta", text: "small" });
-    order.emit({ type: "text_delta", text: "x".repeat(200) });
-    order.emit(terminal);
+    const source = (async function* () {
+      yield { type: "text_delta", text: "small" } as AdapterEvent;
+      yield { type: "text_delta", text: "x".repeat(200) } as AdapterEvent;
+      yield terminal;
+    })();
+    for await (const event of orderDevinMessagesOutput(source, budget, requestAbort.signal, () => producerAbort.abort())) output.push(event);
     expect(output.filter(event => event.type === "error")).toHaveLength(1);
     expect(output.at(-1)).toMatchObject({ type: "error", status: 413, code: "translation_buffer_limit" });
-    expect(abort.signal.aborted).toBe(true);
+    expect(producerAbort.signal.aborted).toBe(true);
+    expect(requestAbort.signal.aborted).toBe(false);
     expect(budget.snapshot().currentBytes).toBe(0);
-    order.dispose();
   });
+
 });
 
 const config = (): OcxConfig => ({ port: 0, defaultProvider: "cognition-custom", claudeCode: { enabled: true },
@@ -189,4 +216,101 @@ test("the Responses ingress retains incremental text before the late signature",
   }), config(), {});
   const text = await response.text();
   expect(text.indexOf("response.output_text.delta")).toBeLessThan(text.indexOf("\"type\":\"reasoning\""));
+});
+
+
+test("a tool call with 3,000 streamed argument fragments drains without overflowing the real queue", async () => {
+  const argumentsText = JSON.stringify({ file_path: "/synthetic/file.txt", content: "x".repeat(3000) });
+  paceFragments = true;
+  upstreamEvents = [{ type: "tool_call_start", id: "call_write", name: "Write" },
+    ...[...argumentsText].map(fragment => ({ type: "tool_call_delta", arguments: fragment }) as AdapterEvent),
+    { type: "tool_call_end" }, { type: "thinking_signature", signature }, terminal];
+  const response = await handleClaudeMessages(new Request("http://localhost/v1/messages", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "cognition-custom/swe-2", max_tokens: 4096, stream: false,
+      messages: [{ role: "user", content: "Write" }],
+      tools: [{ name: "Write", input_schema: { type: "object", properties: { content: { type: "string" } } } }],
+    }),
+  }), config(), {});
+  const result = await response.json();
+  expect(result.stop_reason).toBe("tool_use");
+  expect(result.content.at(-1)).toMatchObject({ type: "tool_use", input: JSON.parse(argumentsText) });
+  expect(result.usage).toMatchObject({ input_tokens: 12, output_tokens: 3 });
+});
+
+test("OAuth preflight releases Messages headers at the first text, before a late signature", async () => {
+  await saveCredential("devin", { access: "devin-session-token$synthetic", refresh: "synthetic",
+    expires: Number.MAX_SAFE_INTEGER, accountId: "synthetic-account", source: "oauth",
+    apiBaseUrl: "https://server.codeium.com" });
+  let finish!: () => void;
+  afterFirstEvent = () => new Promise<void>(resolve => { finish = resolve; });
+  upstreamEvents = [{ type: "text_delta", text: "OK" }, { type: "thinking_signature", signature }, terminal];
+  const oauthConfig: OcxConfig = { port: 0, defaultProvider: "devin", claudeCode: { enabled: true },
+    providers: { devin: { adapter: "devin", authMode: "oauth", baseUrl: "https://server.codeium.com", models: ["swe-2"] } } };
+  const responsePromise = handleClaudeMessages(new Request("http://localhost/v1/messages", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "devin/swe-2", max_tokens: 64, stream: true,
+      messages: [{ role: "user", content: "Reply OK" }] }),
+  }), oauthConfig, {});
+  let headerTimer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const response = await Promise.race([responsePromise,
+      new Promise<never>((_, reject) => { headerTimer = setTimeout(() => reject(new Error("headers waited for terminal")), 1000); })]);
+    expect(response.status).toBe(200);
+    expect(finish).toBeDefined();
+    finish();
+    const result = await collectAnthropicMessage(response.body!, "devin/swe-2", createTestTranslatorBudget());
+    expect(result.content.at(-1)).toEqual({ type: "text", text: "OK" });
+  } finally { clearTimeout(headerTimer); finish?.(); }
+});
+
+
+test("hosted search forwards the typed overflow instead of inventing a client cancellation", async () => {
+  const budget = createTestTranslatorBudget({ maxTurnBytes: 160 });
+  const requestAbort = new AbortController();
+  const producerAbort = new AbortController();
+  const source = orderDevinMessagesOutput((async function* () {
+    yield { type: "text_delta", text: "x".repeat(200) } as AdapterEvent;
+  })(), budget, requestAbort.signal, () => producerAbort.abort());
+  const loop = runTurnWebSearchLoop(source, {
+    parsed: { modelId: "swe-2", stream: true, options: {}, context: { messages: [], tools: [] } },
+    plan: { backend: "exa", hostedTool: { type: "web_search" }, maxSearches: 1,
+      settings: { model: "fixture", reasoning: "low", timeoutMs: 100 },
+      routedModelStallTimeoutMs: 100, stallTimeoutSec: 1, streamRoutedModelOutput: true },
+    abortSignal: requestAbort.signal, translatorBudget: budget,
+    dispatch: async function* () { throw new Error("no search dispatch expected"); },
+  });
+  const output: AdapterEvent[] = [];
+  for await (const event of loop) output.push(event);
+  expect(output).toEqual([expect.objectContaining({ type: "error", status: 413, code: "translation_buffer_limit" })]);
+  expect(producerAbort.signal.aborted).toBe(true);
+  expect(budget.snapshot().currentBytes).toBe(0);
+});
+
+test("cancelling during the terminal drain preserves usage and clears retained semantic events", async () => {
+  const budget = createTestTranslatorBudget();
+  const abort = new AbortController();
+  const iterator = orderDevinMessagesOutput((async function* () {
+    yield { type: "text_delta", text: "partial" } as AdapterEvent;
+    yield terminal;
+  })(), budget, abort.signal, () => abort.abort());
+  expect((await iterator.next()).value).toEqual({ type: "heartbeat" });
+  expect((await iterator.next()).value).toEqual({ type: "text_delta", text: "partial" });
+  abort.abort();
+  expect(budget.snapshot().currentBytes).toBe(0);
+  expect((await iterator.next()).value).toEqual(terminal);
+  expect((await iterator.next()).done).toBe(true);
+});
+
+test("a consumer return releases the ordering buffer without a terminal", async () => {
+  const budget = createTestTranslatorBudget();
+  const abort = new AbortController();
+  const iterator = orderDevinMessagesOutput((async function* () {
+    yield { type: "text_delta", text: "held" } as AdapterEvent;
+    yield terminal;
+  })(), budget, abort.signal, () => abort.abort());
+  await iterator.next();
+  expect(budget.snapshot().currentBytes).toBeGreaterThan(0);
+  await iterator.return();
+  expect(budget.snapshot().currentBytes).toBe(0);
 });

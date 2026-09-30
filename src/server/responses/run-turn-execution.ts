@@ -50,7 +50,7 @@ import { undeclaredToolCallMessage } from "../responses-undeclared-tool-guard";
 import { planWebSearch } from "../../web-search";
 import { runTurnWebSearchInitialParsed, runTurnWebSearchLoop } from "../../web-search/run-turn-loop";
 import { WEB_SEARCH_TOOL_NAME } from "../../web-search/synthetic-tool";
-import { createDevinMessagesOutputOrder } from "../../claude/devin-output-order";
+import { orderDevinMessagesOutput } from "../../claude/devin-output-order";
 
 // LOCAL PATCH (runturn-websearch): top-level fields route binding or the
 // adapter itself may write during a turn. Iteration-local `turnParsed` objects
@@ -182,6 +182,13 @@ export async function executeResponsesRunTurn(
 
     const runTurnAbort = new AbortController();
     const cleanupRunTurnAbort = linkAbortSignal(runTurnAbort, options.abortSignal);
+    const devinProducers = new Set<AbortController>();
+    const orderMessagesOutput = (source: AsyncIterable<AdapterEvent>): AsyncIterable<AdapterEvent> =>
+      inboundWire === "anthropic" && transportState.runTurnAdapter.name === "devin" && !routedCompaction
+        ? orderDevinMessagesOutput(source, translatorBudget, runTurnAbort.signal, () => {
+            for (const producer of devinProducers) producer.abort();
+          })
+        : source;
     const queue = createAdapterEventQueue({
       onBacklogExceeded: () => runTurnAbort.abort(),
     });
@@ -230,7 +237,8 @@ export async function executeResponsesRunTurn(
         options.onCompactionRecoveryAdapterEvent?.(event);
         targetQueue.push(event);
       };
-      let messagesOutput: ReturnType<typeof createDevinMessagesOutputOrder> | undefined;
+      let producerAbort = runTurnAbort;
+      let cleanupProducerAbort: (() => void) | undefined;
       try {
         if (!pacingSlotAcquired) {
           pacingSlot = await waitForProviderRequestSlot(route.providerName, route.provider, route.modelId, runTurnAbort.signal);
@@ -264,13 +272,15 @@ export async function executeResponsesRunTurn(
           },
         );
         if (inboundWire === "anthropic" && transportState.runTurnAdapter.name === "devin" && !routedCompaction) {
-          messagesOutput = createDevinMessagesOutputOrder(emit, translatorBudget, runTurnAbort.signal, () => runTurnAbort.abort());
+          producerAbort = new AbortController();
+          cleanupProducerAbort = linkAbortSignal(producerAbort, runTurnAbort.signal);
+          devinProducers.add(producerAbort);
         }
         await transportState.runTurnAdapter.runTurn?.(
           turnParsed,
           {
             headers: requestState.selectedForwardHeaders,
-            abortSignal: runTurnAbort.signal,
+            abortSignal: producerAbort.signal,
             comboAttempt: options.comboAttempt === true,
             translatorBudget,
             providerFetch: runTurnProviderFetch,
@@ -287,7 +297,7 @@ export async function executeResponsesRunTurn(
             ),
             onRecoveryWithheld: noteAdapterRecoveryWithheld,
           },
-          messagesOutput?.emit ?? emit,
+          emit,
         );
         // LOCAL PATCH (runturn-websearch): adapters may write conversation/
         // continuation state onto the object they received; merge it back so
@@ -301,7 +311,7 @@ export async function executeResponsesRunTurn(
           Object.assign(parsed, routeState);
         }
       } catch (err) {
-        (messagesOutput?.emit ?? emit)(err instanceof RequestPacingQueueOverloadError
+        emit(err instanceof RequestPacingQueueOverloadError
           ? {
               type: "error",
               status: 429,
@@ -326,8 +336,8 @@ export async function executeResponsesRunTurn(
                 message: err instanceof Error ? err.message : String(err),
               });
       } finally {
-        messagesOutput?.flush();
-        messagesOutput?.dispose();
+        devinProducers.delete(producerAbort);
+        cleanupProducerAbort?.();
         releaseProviderRequestSlot(pacingSlot);
         // Cursor assigns a stable conversation id inside runTurn on the first headerless
         // turn; backfill so Logs can filter/total that opening request (#330 / #522).
@@ -352,14 +362,14 @@ export async function executeResponsesRunTurn(
       });
       void runTurnAttempt(iterQueue, undefined, false, iterParsed);
       const stream = iterQueue.stream();
-      if (!runTurnFailoverArmed()) return stream;
+      if (!runTurnFailoverArmed()) return orderMessagesOutput(stream);
       // LOCAL PATCH (runturn-websearch): a post-search iteration can open on a
       // 429 too — the search cells already reached the client, so only this
       // answer call rotates. Preflight replays it on the next account with the
       // grown history intact; a mid-stream error still ends the turn as before.
-      return (async function* () {
+      return orderMessagesOutput((async function* () {
         yield* await preflightRunTurnFailover(stream, iterParsed);
-      })();
+      })());
     };
     // Rebind the turn to an admitted account. The failed attempt emitted no client-visible bytes,
     // so replay is safe, but a Cursor conversation/checkpoint is credential-scoped: carrying its
@@ -621,7 +631,7 @@ export async function executeResponsesRunTurn(
         onBacklogExceeded: () => runTurnAbort.abort(),
       });
       void runTurnAttempt(retryQueue, "empty-completion");
-      return retryQueue.stream();
+      return orderMessagesOutput(retryQueue.stream());
     };
 
     const { toolNsMap, declaredToolNames, toolParameterSchemas, freeformToolNames, bareCustomToolNames, toolSearchToolNames } = toolBridgeMaps;
@@ -706,6 +716,8 @@ export async function executeResponsesRunTurn(
         }
         eventSource = preflight.stream;
       }
+      // Preflight sees raw output before Messages delays text for the late signature.
+      eventSource = orderMessagesOutput(eventSource);
       // LOCAL PATCH (runturn-websearch): intercept web_search calls across
       // iterations; terminal output keeps flowing through the same queue/bridge.
       if (wsPlan) {
