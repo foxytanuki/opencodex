@@ -28,6 +28,11 @@ export async function* orderDevinMessagesOutput(
   };
   const cancel = () => { cancelled = true; release(); };
   signal.addEventListener("abort", cancel, { once: true });
+  const cancelledTerminal = (event: AdapterEvent): AdapterEvent => {
+    if (event.type !== "done" && event.type !== "incomplete") return event;
+    return { type: "error", status: 499, message: "client closed request", retryable: false,
+      ...(event.usage ? { usage: event.usage } : {}) };
+  };
   async function* drain() {
     for (let index = 0; index < held.length && !cancelled; index++) {
       delivering = held[index];
@@ -51,7 +56,7 @@ export async function* orderDevinMessagesOutput(
       if (cancelled) {
         // The adapter's cancellation terminal retains its measured usage. Client
         // stream cancellation instead returns this iterator and stops consumption.
-        if (terminal) { yield event; return; }
+        if (terminal) { yield cancelledTerminal(event); return; }
         continue;
       }
       if (event.type === "heartbeat" || event.type === "thinking_delta"
@@ -76,7 +81,7 @@ export async function* orderDevinMessagesOutput(
       }
       if (terminal) {
         yield* drain();
-        if (cancelled && !terminalDelivered) yield event;
+        if (cancelled && !terminalDelivered) yield cancelledTerminal(event);
         return;
       }
       // Raw preflight already observed real output; feed the stream watchdog while

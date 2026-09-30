@@ -44,7 +44,9 @@ Retained events share the request translator budget and drain on demand without 
 burst into the adapter queue. They are released on terminal, cancellation, overflow, or adapter
 EOF. Overflow emits one typed `translation_buffer_limit` error and aborts only active Devin
 producers, preserving error classification through hosted search. Cancellation drops held
-semantic output but forwards the adapter's terminal and usage when the consumer keeps reading.
+semantic output; this consumer preserves error terminals and maps cancelled success/incomplete
+terminals to a 499 with their original usage, so partial output cannot commit completed replay
+state. Hosted search retains its existing independent cancellation mapping.
 Adapter error and incomplete terminals retain partial output and their original usage.
 Ordering occurs before hosted-search interception, independently for each physical iteration,
 so one iteration's signature cannot be attached to another iteration's answer.

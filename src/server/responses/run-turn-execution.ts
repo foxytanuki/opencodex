@@ -668,6 +668,7 @@ export async function executeResponsesRunTurn(
         retryAfter: resolveClientRetryAfter({ status: httpStatus, message: error.message }),
       });
     };
+    // Messages ingress forces internal streaming, including buffered client requests.
     if (parsed.stream) {
       try {
       void runTurn();

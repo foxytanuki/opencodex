@@ -298,7 +298,7 @@ test("cancelling during the terminal drain preserves usage and clears retained s
   expect((await iterator.next()).value).toEqual({ type: "text_delta", text: "partial" });
   abort.abort();
   expect(budget.snapshot().currentBytes).toBe(0);
-  expect((await iterator.next()).value).toEqual(terminal);
+  expect((await iterator.next()).value).toMatchObject({ type: "error", status: 499, usage });
   expect((await iterator.next()).done).toBe(true);
 });
 
@@ -313,4 +313,49 @@ test("a consumer return releases the ordering buffer without a terminal", async 
   expect(budget.snapshot().currentBytes).toBeGreaterThan(0);
   await iterator.return();
   expect(budget.snapshot().currentBytes).toBe(0);
+});
+
+
+for (const queuedTerminal of [terminal, { type: "incomplete", reason: "max_tokens", usage }] as AdapterEvent[]) {
+  test(`cancel before consuming a queued ${queuedTerminal.type} keeps usage but forbids a successful terminal`, async () => {
+    const budget = createTestTranslatorBudget();
+    const abort = new AbortController();
+    const queue = createAdapterEventQueue();
+    const iterator = orderDevinMessagesOutput(queue.stream(), budget, abort.signal, () => abort.abort());
+    queue.push({ type: "text_delta", text: "held" });
+    expect((await iterator.next()).value).toEqual({ type: "heartbeat" });
+    queue.push(queuedTerminal);
+    queue.close();
+    abort.abort();
+    expect((await iterator.next()).value).toMatchObject({ type: "error", status: 499, retryable: false, usage });
+    expect((await iterator.next()).done).toBe(true);
+    expect(budget.snapshot().currentBytes).toBe(0);
+  });
+}
+
+test("cancelled partial drain never commits a completed response or replay state", async () => {
+  const budget = createTestTranslatorBudget();
+  const abort = new AbortController();
+  const orderedEvents = orderDevinMessagesOutput((async function* () {
+    yield { type: "text_delta", text: "partial" } as AdapterEvent;
+    yield { type: "tool_call_start", id: "call_partial", name: "Write" } as AdapterEvent;
+    yield { type: "tool_call_delta", arguments: '{"content":' } as AdapterEvent;
+    yield terminal;
+  })(), budget, abort.signal, () => abort.abort());
+  const cancelDuringDrain = (async function* () {
+    for await (const event of orderedEvents) {
+      yield event;
+      if (event.type === "text_delta") abort.abort();
+    }
+  })();
+  let completions = 0;
+  const observedUsage: unknown[] = [];
+  const bridge = bridgeToResponsesSSE(cancelDuringDrain, "swe-2", undefined, undefined, undefined, undefined, 0, {
+    translatorBudget: budget, onCompletedResponse: () => { completions++; }, onUsage: value => observedUsage.push(value),
+  });
+  const bytes = await new Response(bridge).text();
+  expect(bytes).not.toContain("response.completed");
+  expect(completions).toBe(0);
+  expect(observedUsage).toContainEqual(usage);
+  expect(bytes).toContain("client closed request");
 });
